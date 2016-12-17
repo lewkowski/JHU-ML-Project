@@ -1,0 +1,184 @@
+---
+title: "PML Fitness Assignment"
+author: "Chris Lewkowski"
+date: "17 December 2016"
+output: html_document
+---
+
+```{r setup, include=FALSE, echo=FALSE, warning=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+```
+
+# Practical Machine Learning - Fitness Prediction Assignment
+
+This assignment applies a machine learning technique to predict the gym activity of a group of people by the information recorded from their fitness device.
+
+It is a required submission for the JHU Practical Machine Learning course on Coursera: [Practical Machine Learning Project](https://www.coursera.org/learn/practical-machine-learning/peer/R43St/prediction-assignment-writeup)
+
+```{r Load-Data, warning=FALSE}
+require(tidyverse)
+
+# Read in the data
+original_sample <- read.csv("Data/pml-training.csv", na.strings = c("","NA"))
+original_validation <- read.csv("Data/pml-testing.csv", na.strings = c("","NA"))
+```
+
+## Prepare the data
+The dataset is relatively clean, althought there are over 30 columns with no data or very little data (see Appendix - Summary Statistics). Firstly columns that have more than 95% NA's or blank fields are removed. The first seven columns are not relevant as features because they are either time based, id fields or specific to the setup of the device, so they are removed.
+
+```{r Remove, warning=FALSE}
+columns_to_keep <- colSums(is.na(original_sample)) < (.05 * nrow(original_sample))
+  
+validation <- original_validation[, columns_to_keep]
+cleaned_sample <- original_sample[, columns_to_keep]
+
+validation <- validation[,-c(1:7)]
+cleaned_sample <- cleaned_sample[,-c(1:7)]
+```
+
+The original sample data will need to partitioned into a training and test set. As there is a reasonably large number of samples > 19000, a split of 70:30 will be used.
+
+```{r Split & Stratify, warning=FALSE}
+require(caret)
+
+# Set random seed for reproducibility
+set.seed(1234)
+# Split the dataset into 75:25, train, test
+inTrain <- createDataPartition(cleaned_sample$classe, p = 0.70, list = FALSE )
+# Create the train & test datasets
+train <- cleaned_sample[inTrain, ]
+test <- cleaned_sample[-inTrain, ]
+
+```
+The data are now ready for training.
+
+# Train a model
+There are five discrete classes of outcome to predict so a classification model would be suitable for this problem. The model chosen for this assignment is Random Forest.
+
+As Random Forest is CPU intensive the doParallel library will be used to make use of all available CPU processors to speed up execution.
+
+```{r Parallel, warning=FALSE}
+
+# Load up the parallel processing libraries to speed things up and make use of multiple CPUs
+library(parallel)
+library(doParallel)
+
+cl <- makeCluster(detectCores())
+registerDoParallel(cl)
+
+```
+## Feature Selection
+
+To evaluate which combination of features are most likely to yield good results, Recursive Feature Selection will be used. It is configured to try subsets with sizes 1, 2, 3, 4, 5, 10, 15, 20, 25, 35, 45 & 52. Five fold cross validation is used to help mitigate overfitting.
+
+```{r Model, warning=FALSE}
+
+# Take a smaller sample while optimising
+#train_temp <- sample_n(train, nrow(train)/4)
+
+subsets <- seq(1, ncol(train), 3)
+
+ctrl <- rfeControl(functions = rfFuncs,
+                   method = "repeatedcv",
+                   number = 5,
+                   repeats = 5,
+                   verbose = FALSE,
+                   allowParallel = TRUE)
+
+system.time( 
+  rfProfile <- rfe(
+  classe ~ .,
+  preProcess = c("center", "scale"),
+  rfeControl = ctrl,
+  sizes = subsets,
+  data = train)
+)
+
+plot(rfProfile)
+
+```
+
+From the plot it can be seen that the optimal accuracy with the model subsets chosen uses `r length(rfProfile$optVariables)` features. Of interest is using 15 features gives very good results then the remaining `r length(rfProfile$optVariables) - 15` features offer dimishing returns.
+
+List of features to use:
+```{r Random Forest Variables, warning=FALSE}
+rfProfile$optVariables
+```
+
+## Random Forest Model
+
+A random forest model is used with 5-fold cross validaion, the `r length(rfProfile$optVariables)` features from recursive feature elimination and a specified grid to tune to: mtry = number of variables to sample at each split. The features have normalised using the built in scale and centre options.
+
+```{r Random Forest Training, warning=FALSE}
+# Select the variables selected from RFE
+train_temp <- cbind(train[rfProfile$optVariables], classe = train$classe)
+
+tunegrid <- expand.grid(.mtry = c(2:6, seq(7,ncol(train_temp), by = 3)))
+
+train_ctrl <- trainControl (
+  classProbs=TRUE,
+  search = "grid",
+  savePredictions=TRUE,
+  # Use Cross Validation
+  method = "cv",
+  # Use 5 folds
+  number = 5,
+  repeats = 5,
+  allowParallel = TRUE)
+
+system.time( 
+  model_fit <- train(
+  classe ~ .,
+  method = "rf",
+  preProcess = c("center", "scale"),
+  trControl = train_ctrl,
+  tuneGrid=tunegrid,
+  data = train_temp)
+)
+
+# Stop the parallel cluster
+stopCluster(cl)  
+
+importance <- varImp(model_fit, scale=FALSE)
+
+# plot importance
+plot(importance)
+
+print(model_fit, digits = 3)
+
+```
+
+The model shows a good fit over the training set with accuracy over 98% for all values of mtry. Now to see how it compares over the test set.
+
+```{r Predict over test set, warning=FALSE}
+
+prediction <- predict(model_fit, newdata = test)
+
+confusion <- confusionMatrix(prediction, test$classe)
+
+print(confusionMatrix(prediction, test$classe), digits=3)
+
+```
+
+The prediction for the test set is very good with sensitivity, specificity and accuracy all over 99%. The model should generalise well over the 20 sample test set.
+
+## Out of sample error
+
+The out of sample error is the error rate from applying the model to predict over data that was not used in the training, in this case *test*. This yielded an out of sample error of `r 1 - confusion$overall["Accuracy"]`.
+
+# Prediction over Project Test set
+
+This project has a set of 20 cases that are required to be predicted using the trained model. The values for the prediction are below:
+```{r Project Case Prediction, warning=FALSE}
+prediction <- predict(model_fit, newdata = validation)
+
+prediction
+```
+End of assignment.
+
+# Appendix - Summary Statistics
+```{r Summary-Statistics, warning=FALSE}
+summary(original_sample)
+```
+
